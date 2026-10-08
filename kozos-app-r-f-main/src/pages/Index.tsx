@@ -1,11 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
-import { onValue, ref, set } from "firebase/database";
-import { realtimeDb } from "@/lib/firebase";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { onValue, push, ref, remove, set } from "firebase/database";
 import type { LucideIcon } from "lucide-react";
 import {
   Award,
-  Bell,
   CalendarDays,
+  CarFront,
   Check,
   CheckCircle2,
   ChevronRight,
@@ -40,6 +39,8 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { VehiclesView, type Vehicle, type VehicleFormData } from "@/components/VehiclesView";
+import { realtimeDb } from "@/lib/firebase";
 import { cn } from "@/lib/utils";
 
 type View =
@@ -49,6 +50,7 @@ type View =
   | "calendar"
   | "payments"
   | "budget"
+  | "vehicles"
   | "leaderboard"
   | "settings";
 type Priority = "Magas" | "Közepes" | "Alacsony";
@@ -62,7 +64,7 @@ type FamilyMember = {
 };
 
 const CURRENT_DATE = "2026-09-29";
-const familyMembers: FamilyMember[] = [
+const defaultFamilyMembers: FamilyMember[] = [
   { name: "Elod", initials: "EL", symbol: "🐺", tone: "bg-[#f7a78f] text-[#803c32]", role: "admin" },
   { name: "Laura", initials: "LA", symbol: "🦅", tone: "bg-[#83c9b9] text-[#225f55]", role: "user" },
   { name: "Mama", initials: "MA", symbol: "🦉", tone: "bg-[#a9b7ee] text-[#39468b]", role: "user" },
@@ -70,8 +72,9 @@ const familyMembers: FamilyMember[] = [
   { name: "Zengo", initials: "ZE", symbol: "🐉", tone: "bg-[#c59de8] text-[#5c3478]", role: "user" },
   { name: "Zete", initials: "ZT", symbol: "🐎", tone: "bg-[#8fc5ee] text-[#214c75]", role: "user" },
 ];
+let familyMembers: FamilyMember[] = [...defaultFamilyMembers];
 
-type Task = {
+      type Task = {
   id: number;
   title: string;
   category: string;
@@ -101,7 +104,13 @@ type Bill = {
   icon: LucideIcon;
   tone: string;
 };
-
+type BudgetSource = {
+  id: string;
+  amount: string;
+  source: string;
+  date: string;
+  createdAt: number;
+};
 const initialTasks: Task[] = [];
 const initialBills: Bill[] = [];
 
@@ -111,8 +120,14 @@ const navItems: { id: View; label: string; icon: LucideIcon }[] = [
   { id: "bills", label: "Számlák", icon: CreditCard },
   { id: "payments", label: "Kifizetések", icon: ReceiptText },
   { id: "budget", label: "Költségvetés", icon: PiggyBank },
+  { id: "vehicles", label: "Autók", icon: CarFront },
   { id: "calendar", label: "Naptár", icon: CalendarDays },
   { id: "leaderboard", label: "Legszorgalmasabb", icon: Award },
+];
+
+const mobileNavItems: { id: View; label: string; icon: LucideIcon }[] = [
+  ...navItems,
+  { id: "settings", label: "Beállítások", icon: Settings2 },
 ];
 
 const monthlyCompletion: { name: string; symbol: string; completed: number; tone: string }[] = [];
@@ -148,6 +163,18 @@ function memberSymbolForInitials(initials: string) {
 
 function memberSymbolForName(name: string) {
   return familyMembers.find((member) => member.name === name)?.symbol || "•";
+}
+
+function vehicleOwnerKey(name: string) {
+  return name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+}
+
+function familyMemberKey(name: string) {
+  return name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+}
+
+function initialsFromName(name: string) {
+  return name.trim().split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase();
 }
 
 function formatLei(amount: string) {
@@ -457,9 +484,13 @@ function NewBillDialog({
   const [amount, setAmount] = useState("");
   const [due, setDue] = useState("");
   const [type, setType] = useState("Háztartás");
+  const submittingRef = useRef(false);
 
   const submit = () => {
     if (!name.trim() || !amount.trim() || !due.trim()) return;
+    if (submittingRef.current) return;
+
+  submittingRef.current = true;
     onAdd({
       id: Date.now(),
       name: name.trim(),
@@ -475,6 +506,7 @@ function NewBillDialog({
     setAmount("");
     setDue("");
     setOpen(false);
+    submittingRef.current = false;
     toast.success("Új számla hozzáadva", {
       description: currentUser ? `Rögzítette: ${currentUser}` : "A számlák között már látható.",
     });
@@ -987,173 +1019,414 @@ function LoginDialog({
   );
 }
 
-type StoredBill = Omit<Bill, "icon"> & { icon?: string };
-
-const firebaseTasksRef = ref(realtimeDb, "kozosNap/tasks");
-const firebaseBillsRef = ref(realtimeDb, "kozosNap/bills");
-const firebaseIncomeRef = ref(realtimeDb, "kozosNap/monthlyIncome");
-
-function serializeBill(bill: Bill): StoredBill {
-  return { ...bill, icon: "receipt" };
-}
-
-function deserializeBill(raw: StoredBill): Bill {
-  return { ...raw, icon: ReceiptText };
-}
-
 export default function Index() {
   const [view, setView] = useState<View>("home");
   const [tasks, setTasks] = useState<Task[]>(initialTasks);
   const [bills, setBills] = useState<Bill[]>(initialBills);
+  useEffect(() => {
+  const tasksRef = ref(realtimeDb, "tasks");
+
+  return onValue(
+    tasksRef,
+    (snapshot) => {
+      const stored = snapshot.val() as Record<string, Task> | null;
+      const loaded = stored ? Object.values(stored) : [];
+      setTasks(loaded);
+    },
+    () => toast.error("A feladatok betöltése nem sikerült.")
+  );
+}, []);
+useEffect(() => {
+  const billsRef = ref(realtimeDb, "bills");
+  useEffect(() => {
+  const budgetSourcesRef = ref(realtimeDb, "budgetSources");
+
+  return onValue(
+    budgetSourcesRef,
+    (snapshot) => {
+      const stored = snapshot.val() as Record<string, BudgetSource> | null;
+      const loaded = stored ? Object.values(stored) : [];
+
+      setBudgetSources(
+        loaded.sort((a, b) => b.createdAt - a.createdAt)
+      );
+    },
+    (error) => {
+      console.error("Költségvetési források betöltési hiba:", error);
+      toast.error("A költségvetési források betöltése nem sikerült.");
+    }
+  );
+}, []);
+
+  return onValue(
+    billsRef,
+    (snapshot) => {
+      const stored = snapshot.val();
+
+      if (!stored) {
+        setBills([]);
+        return;
+      }
+
+      const loaded = Object.entries(stored).map(
+        ([firebaseId, bill]) => ({
+          ...(bill as Omit<Bill, "icon">),
+          id: Number(firebaseId),
+          icon: Home,
+        })
+      );
+
+      setBills(loaded);
+    },
+    (error) => {
+      console.error("Bills betöltési hiba:", error);
+      toast.error("A számlák betöltése nem sikerült.");
+    }
+  );
+}, []);
   const [filter, setFilter] = useState("Mind");
   const [search, setSearch] = useState("");
-  const [userName, setUserName] = useState("");
-  const [monthlyIncome, setMonthlyIncome] = useState("");
+  const [userName, setUserName] = useState(
+  () => localStorage.getItem("kozosapp_user") || ""
+);
+  const [members, setMembers] = useState<FamilyMember[]>(familyMembers);
+  
+  const [budgetSources, setBudgetSources] = useState<BudgetSource[]>([]);
   const [editingTask, setEditingTask] = useState<Task | null>(null);
   const [editingBill, setEditingBill] = useState<Bill | null>(null);
-  const [tasksLoaded, setTasksLoaded] = useState(false);
-  const [billsLoaded, setBillsLoaded] = useState(false);
-  const [incomeLoaded, setIncomeLoaded] = useState(false);
+  const [vehicles, setVehicles] = useState<Vehicle[]>([]);
+  const [vehiclesLoading, setVehiclesLoading] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  useEffect(() => {
-    const unsubscribeTasks = onValue(firebaseTasksRef, (snapshot) => {
-      const value = snapshot.val();
-      if (!value) {
-        setTasks([]);
-      } else {
-        const loaded = Object.values(value as Record<string, Task>);
-        setTasks(loaded.sort((a, b) => b.id - a.id));
-      }
-      setTasksLoaded(true);
-    });
-
-    const unsubscribeBills = onValue(firebaseBillsRef, (snapshot) => {
-      const value = snapshot.val();
-      if (!value) {
-        setBills([]);
-      } else {
-        const loaded = Object.values(value as Record<string, StoredBill>)
-          .map(deserializeBill)
-          .sort((a, b) => b.id - a.id);
-        setBills(loaded);
-      }
-      setBillsLoaded(true);
-    });
-
-    const unsubscribeIncome = onValue(firebaseIncomeRef, (snapshot) => {
-      setMonthlyIncome(snapshot.val() ?? "");
-      setIncomeLoaded(true);
-    });
-
-    return () => {
-      unsubscribeTasks();
-      unsubscribeBills();
-      unsubscribeIncome();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!tasksLoaded) return;
-    const payload = tasks.reduce<Record<string, Task>>((acc, task) => {
-      acc[String(task.id)] = task;
-      return acc;
-    }, {});
-    void set(firebaseTasksRef, payload);
-  }, [tasks, tasksLoaded]);
-
-  useEffect(() => {
-    if (!billsLoaded) return;
-    const payload = bills.reduce<Record<string, StoredBill>>((acc, bill) => {
-      acc[String(bill.id)] = serializeBill(bill);
-      return acc;
-    }, {});
-    void set(firebaseBillsRef, payload);
-  }, [bills, billsLoaded]);
-
-  useEffect(() => {
-    if (!incomeLoaded) return;
-    void set(firebaseIncomeRef, monthlyIncome || "");
-  }, [monthlyIncome, incomeLoaded]);
-
-  const currentMember = familyMembers.find((member) => member.name === userName);
+  const currentMember = members.find((member) => member.name === userName);
   const isAdmin = currentMember?.role === "admin";
   const canModifyTasks = Boolean(currentMember);
   const canDeleteTasks = isAdmin;
 
-  const toggleTask = (id: number) => {
-    if (!canModifyTasks) return;
-    setTasks((current) =>
-      current.map((task) => {
-        if (task.id !== id) return task;
-        const done = !task.done;
-        return {
-          ...task,
-          done,
-          completedBy: done ? userName || task.completedBy || task.assignee : "",
-          completedAt: done ? CURRENT_DATE : "",
-        };
-      })
+  useEffect(() => {
+    const membersRef = ref(realtimeDb, "familyMembers");
+    return onValue(
+      membersRef,
+      (snapshot) => {
+        const stored = snapshot.val() as Record<string, FamilyMember> | null;
+        const loaded = stored ? Object.values(stored) : defaultFamilyMembers;
+        familyMembers = loaded;
+        setMembers(loaded);
+      },
+      () => toast.error("A felhasználói lista betöltése nem sikerült.")
     );
+  }, []);
+
+  const saveMembers = async (nextMembers: FamilyMember[]) => {
+    const membersData = Object.fromEntries(nextMembers.map((member) => [familyMemberKey(member.name), member]));
+    await set(ref(realtimeDb, "familyMembers"), membersData);
+    familyMembers = nextMembers;
+    setMembers(nextMembers);
   };
 
-  const toggleBill = (id: number) => {
-    if (!isAdmin) return;
-    setBills((current) =>
-      current.map((bill) => {
-        if (bill.id !== id) return bill;
-        const paid = !bill.paid;
-        return {
-          ...bill,
-          paid,
-          paidBy: paid ? userName || bill.paidBy || bill.createdBy : "",
-          paidAt: paid ? CURRENT_DATE : "",
-        };
-      })
+  const addMember = async (name: string) => {
+    if (!isAdmin) throw new Error("Nincs adminisztrátori jogosultság.");
+    const trimmedName = name.trim();
+    if (!trimmedName) throw new Error("A név kötelező.");
+    if (members.some((member) => member.name.toLowerCase() === trimmedName.toLowerCase())) throw new Error("Ez a felhasználó már létezik.");
+    const newMember: FamilyMember = { name: trimmedName, initials: initialsFromName(trimmedName), symbol: "👤", tone: "bg-[#d8c7f2] text-[#5c3478]", role: "user" };
+    await saveMembers([...members, newMember]);
+  };
+
+  const removeMember = async (name: string) => {
+    if (!isAdmin || name === "Elod") throw new Error("Ezt a felhasználót nem lehet eltávolítani.");
+    await saveMembers(members.filter((member) => member.name !== name));
+  };
+
+  useEffect(() => {
+    if (!userName) {
+      setVehicles([]);
+      setVehiclesLoading(false);
+      return;
+    }
+    const vehiclesRef = ref(realtimeDb, "vehicles");
+setVehiclesLoading(true);
+
+return onValue(
+  vehiclesRef,
+  (snapshot) => {
+    const stored = (snapshot.val() || {}) as Record<
+      string,
+      Record<string, Partial<Vehicle>>
+    >;
+
+    const loaded = Object.entries(stored).flatMap(
+      ([ownerKey, ownerVehicles]) =>
+        Object.entries(ownerVehicles || {}).map(([id, vehicle]) => ({
+          id,
+          ownerKey: vehicle.ownerKey || ownerKey,
+          ownerName: vehicle.ownerName || ownerKey,
+          makeModel: vehicle.makeModel || "",
+          licensePlate: vehicle.licensePlate || "",
+          currentMileage: vehicle.currentMileage || 0,
+          oilChangeIntervalKm: vehicle.oilChangeIntervalKm ?? null,
+          nextOilChangeKm: vehicle.nextOilChangeKm ?? null,
+          timingBeltKm: vehicle.timingBeltKm ?? null,
+          brakeService: vehicle.brakeService || "",
+          technicalInspectionDate: vehicle.technicalInspectionDate || "",
+          insuranceExpiryDate: vehicle.insuranceExpiryDate || "",
+          maintenanceNotes: vehicle.maintenanceNotes || "",
+          createdAt: vehicle.createdAt || 0,
+          updatedAt: vehicle.updatedAt || 0,
+        }))
     );
+
+    setVehicles(loaded);
+    setVehiclesLoading(false);
+  },
+  () => {
+    setVehiclesLoading(false);
+    toast.error("A járművek betöltése nem sikerült.");
+  }
+);}, []);
+  const addVehicle = async (data: VehicleFormData) => {
+    if (!userName) throw new Error("Nincs bejelentkezett felhasználó.");
+    const ownerKey = vehicleOwnerKey(userName);
+    const vehicleRef = push(ref(realtimeDb, `vehicles/${ownerKey}`));
+    const now = Date.now();
+    const storedVehicle = { ...data, ownerKey, ownerName: userName, createdAt: now, updatedAt: now };
+    await set(vehicleRef, storedVehicle);
+    if (vehicleRef.key) setVehicles((current) => [...current, { id: vehicleRef.key!, ...storedVehicle }]);
   };
 
-  const addTask = (task: Task) => {
-    if (canModifyTasks) setTasks((current) => [task, ...current]);
+  const updateVehicle = async (id: string, data: VehicleFormData) => {
+    if (!userName) throw new Error("Nincs bejelentkezett felhasználó.");
+    const ownerKey = vehicleOwnerKey(userName);
+    const existing = vehicles.find((vehicle) => vehicle.id === id);
+    const storedVehicle = { ...data, ownerKey, ownerName: userName, createdAt: existing?.createdAt || Date.now(), updatedAt: Date.now() };
+    await set(ref(realtimeDb, `vehicles/${ownerKey}/${id}`), storedVehicle);
+    setVehicles((current) => current.map((vehicle) => vehicle.id === id ? { id, ...storedVehicle } : vehicle));
   };
 
-  const addBill = (bill: Bill) => {
-    if (isAdmin) setBills((current) => [bill, ...current]);
+  const deleteVehicle = async (id: string) => {
+    if (!userName) throw new Error("Nincs bejelentkezett felhasználó.");
+    const ownerKey = vehicleOwnerKey(userName);
+    await remove(ref(realtimeDb, `vehicles/${ownerKey}/${id}`));
+    setVehicles((current) => current.filter((vehicle) => vehicle.id !== id));
+    toast.success("A jármű törölve.");
   };
 
-  const updateTask = (task: Task) => {
-    if (!canModifyTasks) return;
+  const toggleTask = async (id: number) => {
+  if (!canModifyTasks) return;
+
+  const currentTask = tasks.find((task) => task.id === id);
+  if (!currentTask) return;
+
+  const done = !currentTask.done;
+
+  const updatedTask = {
+    ...currentTask,
+    done,
+    completedBy: done
+      ? userName || currentTask.completedBy || currentTask.assignee
+      : "",
+    completedAt: done ? CURRENT_DATE : "",
+  };
+
+  try {
+    await set(ref(realtimeDb, `tasks/${id}`), updatedTask);
+
     setTasks((current) =>
-      current.map((item) =>
-        item.id === task.id ? { ...task, createdBy: userName || task.createdBy || task.assignee } : item
+      current.map((task) =>
+        task.id === id ? updatedTask : task
       )
     );
+  } catch (error) {
+    console.error(error);
+    toast.error("A feladat állapotának mentése nem sikerült.");
+  }
+};
+
+  const toggleBill = async (id: number) => {
+  if (!isAdmin) return;
+
+  const currentBill = bills.find((bill) => bill.id === id);
+  if (!currentBill) return;
+
+  const paid = !currentBill.paid;
+
+  const updatedBill = {
+    ...currentBill,
+    paid,
+    paidBy: paid
+      ? userName || currentBill.paidBy || currentBill.createdBy
+      : "",
+    paidAt: paid ? CURRENT_DATE : "",
+  };
+
+  try {
+    const { icon, ...billData } = updatedBill;
+
+    await set(ref(realtimeDb, `bills/${id}`), billData);
+
+    setBills((current) =>
+      current.map((bill) =>
+        bill.id === id ? updatedBill : bill
+      )
+    );
+  } catch (error) {
+    console.error(error);
+    toast.error("A számla állapotának mentése nem sikerült.");
+  }
+};
+
+  const addTask = async (task: Task) => {
+  if (!canModifyTasks) return;
+
+  try {
+    await set(ref(realtimeDb, `tasks/${task.id}`), task);
+      } catch (error) {
+    console.error(error);
+    toast.error("A feladat mentése nem sikerült.");
+  }
+};
+
+  const addBill = async (bill: Bill) => {
+  if (!isAdmin) return;
+
+  try {
+    const { icon, ...billData } = bill;
+
+    await set(ref(realtimeDb, `bills/${bill.id}`), billData);
+    setBills((current) => [bill, ...current]);
+  } catch (error) {
+    console.error(error);
+    toast.error("A számla mentése nem sikerült.");
+  }
+};
+const addBudgetSource = async (amount: string, source: string) => {
+  const normalizedAmount = amount.trim();
+  const normalizedSource = source.trim();
+
+  if (!normalizedAmount) {
+    throw new Error("Az összeg megadása kötelező.");
+  }
+
+  if (amountValue(normalizedAmount) <= 0) {
+    throw new Error("Az összegnek nagyobbnak kell lennie 0-nál.");
+  }
+
+  if (!normalizedSource) {
+    throw new Error("A forrás kiválasztása kötelező.");
+  }
+
+  const sourceRef = push(ref(realtimeDb, "budgetSources"));
+
+  const newSource: BudgetSource = {
+    id: sourceRef.key || String(Date.now()),
+    amount: normalizedAmount,
+    source: normalizedSource,
+    date: new Date().toISOString().slice(0, 10),
+    createdAt: Date.now(),
+  };
+
+  await set(sourceRef, newSource);
+
+  setBudgetSources((current) => [newSource, ...current]);
+};
+  const updateTask = async (task: Task) => {
+  if (!canModifyTasks) return;
+
+  try {
+    const updatedTask = {
+      ...task,
+      createdBy: userName || task.createdBy || task.assignee,
+    };
+
+    await set(ref(realtimeDb, `tasks/${task.id}`), updatedTask);
+
+    setTasks((current) =>
+      current.map((item) =>
+        item.id === task.id ? updatedTask : item
+      )
+    );
+
     setEditingTask(null);
     toast.success("A feladat adatai frissítve.");
-  };
+  } catch (error) {
+    console.error(error);
+    toast.error("A feladat mentése nem sikerült.");
+  }
+};
+     const updateBill = async (bill: Bill) => {
+  if (!isAdmin) return;
 
-  const updateBill = (bill: Bill) => {
-    if (!isAdmin) return;
+  try {
+    const updatedBill = {
+      ...bill,
+      createdBy: userName || bill.createdBy,
+    };
+
+    const { icon, ...billData } = updatedBill;
+
+    await set(ref(realtimeDb, `bills/${bill.id}`), billData);
+
     setBills((current) =>
       current.map((item) =>
-        item.id === bill.id ? { ...bill, createdBy: userName || bill.createdBy } : item
+        item.id === bill.id ? updatedBill : item
       )
     );
+
     setEditingBill(null);
     toast.success("A számla adatai frissítve.");
-  };
+  } catch (error) {
+    console.error(error);
+    toast.error("A számla mentése nem sikerült.");
+  }
+};
+      const deleteTask = async (id: number) => {
+  if (!isAdmin || !window.confirm("Biztosan törlöd ezt a feladatot?")) return;
 
-  const deleteTask = (id: number) => {
-    if (!isAdmin || !window.confirm("Biztosan törlöd ezt a feladatot?")) return;
-    setTasks((current) => current.filter((task) => task.id !== id));
+  try {
+    await remove(ref(realtimeDb, `tasks/${id}`));
+
+    setTasks((current) =>
+      current.filter((task) => task.id !== id)
+    );
+
     toast.success("A feladat törölve.");
-  };
+  } catch (error) {
+    console.error(error);
+    toast.error("A feladat törlése nem sikerült.");
+  }
+};
+  const deleteBill = async (id: number) => {
+  if (!isAdmin || !window.confirm("Biztosan törlöd ezt a számlát?")) return;
 
-  const deleteBill = (id: number) => {
-    if (!isAdmin || !window.confirm("Biztosan törlöd ezt a számlát?")) return;
-    setBills((current) => current.filter((bill) => bill.id !== id));
-    toast.success("A számla törölve.");
-  };
+  try {
+    alert("A törlendő számla ID-ja: " + id);
+    console.log("ÖSSZES BILL ID:", bills.map((bill) => bill.id));
 
+    const bill = bills.find((item) => item.id === id);
+
+    if (!bill) {
+      toast.error("A számla nem található.");
+      return;
+    }
+
+    const deleteRef = ref(realtimeDb, `bills/${bill.id}`);
+
+    console.log("FIREBASE PATH:", deleteRef.toString());
+
+    await remove(deleteRef);
+
+    console.log("REMOVE KÉSZ");
+
+    setBills((current) =>
+      current.filter((item) => item.id !== id)
+    );
+
+    toast.success("A számla törölve!");
+  } catch (error) {
+    console.error("TÖRLÉSI HIBA:", error);
+    toast.error("A számla törlése nem sikerült.");
+  }
+};
   const filteredTasks = useMemo(
     () =>
       tasks.filter(
@@ -1218,42 +1491,31 @@ export default function Index() {
         <main className="min-w-0 flex-1 pb-24 lg:pb-8">
           <header className="flex items-center justify-between px-5 pb-4 pt-6 sm:px-8 sm:pt-8 lg:px-12">
             <div className="flex items-center gap-3">
-              <button className="rounded-xl p-2 text-[#aaa6b8] hover:bg-[#111111] lg:hidden">
+              <button onClick={() => setMobileMenuOpen(true)} aria-label="Mobil menü megnyitása" className="rounded-xl p-2 text-[#aaa6b8] hover:bg-[#111111] lg:hidden">
                 <Menu className="h-5 w-5" />
               </button>
               <div className="lg:hidden">
                 <AppLogo small />
               </div>
-              <div className="hidden sm:block">
-                <p className="text-[12px] font-bold text-[#aaa6b8]">Kedd, 29.09.2026.</p>
-                <h1 className="mt-0.5 text-[22px] font-extrabold tracking-[-0.04em] text-[#f3f0ff]">
-                  Jó reggelt, {userName || "család"}! <span>☀️</span>
-                </h1>
-              </div>
             </div>
             <div className="flex items-center gap-2.5">
               <LoginDialog
-                userName={userName}
-                onLogin={setUserName}
-                onLogout={() => setUserName("")}
-              />
-              <button className="relative flex h-10 w-10 items-center justify-center rounded-[13px] bg-[#111111] text-[#aaa6b8] shadow-[0_4px_15px_rgba(74,63,135,0.05)]">
-                <Bell className="h-[18px] w-[18px]" />
-                <span className="absolute right-[9px] top-[8px] h-1.5 w-1.5 rounded-full bg-[#ed8067] ring-2 ring-white" />
-              </button>
+  userName={userName}
+  onLogin={(name) => {
+    localStorage.setItem("kozosapp_user", name);
+    setUserName(name);
+  }}
+  onLogout={() => {
+    localStorage.removeItem("kozosapp_user");
+    setUserName("");
+  }}
+/>
               <div className="hidden h-10 w-10 items-center justify-center rounded-full bg-[#f7a78f] text-xl sm:flex">
                 {memberSymbolForName(userName || "Elod")}
               </div>
             </div>
           </header>
           <div className="px-5 sm:px-8 lg:px-12">
-            <div className="mb-5 sm:hidden">
-              <p className="text-[12px] font-bold text-[#aaa6b8]">Kedd, 29.09.2026.</p>
-              <h1 className="mt-0.5 text-[21px] font-extrabold tracking-[-0.04em] text-[#f3f0ff]">
-                Jó reggelt, {userName || "család"}! <span>☀️</span>
-              </h1>
-            </div>
-
             {view === "home" && (
               <HomeView
                 tasks={tasks}
@@ -1303,11 +1565,21 @@ export default function Index() {
             )}
             {view === "payments" && <PaymentsView bills={bills} />}
             {view === "budget" && (
-              <BudgetView
-                bills={bills}
-                monthlyIncome={monthlyIncome}
-                canManage={isAdmin}
-                onIncomeChange={setMonthlyIncome}
+  <BudgetView
+    bills={bills}
+    budgetSources={budgetSources}
+    canManage={isAdmin}
+    onAddSource={addBudgetSource}
+  />
+)}
+            {view === "vehicles" && (
+              <VehiclesView
+                vehicles={vehicles}
+                userName={userName}
+                loading={vehiclesLoading}
+                onCreate={addVehicle}
+                onUpdate={updateVehicle}
+                onDelete={deleteVehicle}
               />
             )}
             {view === "calendar" && (
@@ -1321,27 +1593,29 @@ export default function Index() {
               />
             )}
             {view === "leaderboard" && <LeaderboardView />}
-            {view === "settings" && <SettingsView />}
+            {view === "settings" && <SettingsView currentUser={userName} isAdmin={isAdmin} members={members} onAddMember={addMember} onRemoveMember={removeMember} />}
           </div>
         </main>
       </div>
       <EditTaskDialog task={editingTask} onClose={() => setEditingTask(null)} onSave={updateTask} />
       <EditBillDialog bill={editingBill} onClose={() => setEditingBill(null)} onSave={updateBill} />
-      <nav className="fixed bottom-0 left-0 right-0 z-20 flex items-center justify-around border-t border-[#252525] bg-[#111111]/95 px-2 py-2 backdrop-blur lg:hidden">
-        {navItems.map(({ id, label, icon: Icon }) => (
-          <button
-            key={id}
-            onClick={() => setView(id)}
-            className={cn(
-              "flex min-w-[64px] flex-col items-center gap-1 rounded-[12px] px-2 py-1.5 text-[10px] font-bold",
-              view === id ? "text-[#6d5ef5]" : "text-[#aaa6b8]"
-            )}
-          >
-            <Icon className="h-[19px] w-[19px]" />
-            {label}
-          </button>
-        ))}
-      </nav>
+      {mobileMenuOpen && <nav className="fixed bottom-0 left-0 right-0 z-20 touch-pan-x overflow-x-auto scroll-smooth border-t border-[#252525] bg-[#111111]/95 py-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))] backdrop-blur lg:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        <div className="flex min-w-max items-center gap-1 px-2">
+          {mobileNavItems.map(({ id, label, icon: Icon }) => (
+            <button
+              key={id}
+              onClick={() => { setView(id); setMobileMenuOpen(false); }}
+              className={cn(
+                "flex min-w-[72px] shrink-0 flex-col items-center gap-1 rounded-[12px] px-2.5 py-1.5 text-[10px] font-bold transition-colors",
+                view === id ? "bg-[#f0edff] text-[#6d5ef5]" : "text-[#aaa6b8] hover:bg-[#1a1a1a] hover:text-[#ddd8ef]"
+              )}
+            >
+              <Icon className="h-[19px] w-[19px]" />
+              {label}
+            </button>
+          ))}
+        </div>
+      </nav>}
     </div>
   );
 }
@@ -1476,6 +1750,41 @@ function HomeView({
           </div>
         </section>
         <section>
+          <div className="mb-7">
+  <SectionTitle
+    icon={PiggyBank}
+    title="Források"
+    count={budgetSources.length}
+  />
+
+  <div className="space-y-2.5">
+    {budgetSources.length === 0 ? (
+      <div className="rounded-[16px] border border-[#252525] bg-[#111111] p-4 text-center text-xs text-[#aaa6b8]">
+        Még nincs hozzáadott bevételi forrás.
+      </div>
+    ) : (
+      budgetSources.map((source) => (
+        <div
+          key={source.id}
+          className="flex items-center justify-between rounded-[16px] border border-[#252525] bg-[#111111] px-4 py-3"
+        >
+          <div>
+            <p className="text-[12px] font-extrabold text-[#f3f0ff]">
+              {source.source}
+            </p>
+            <p className="mt-0.5 text-[10px] text-[#aaa6b8]">
+              {formatDate(source.date)}
+            </p>
+          </div>
+
+          <p className="text-[13px] font-extrabold text-[#83c9b9]">
+            +{formatLeiTotal(amountValue(source.amount))}
+          </p>
+        </div>
+      ))
+    )}
+  </div>
+</div>
           <SectionTitle
             icon={CreditCard}
             title="Közelgő számlák"
@@ -1793,16 +2102,19 @@ function CalendarView({
 
 function BudgetView({
   bills,
-  monthlyIncome,
+  budgetSources,
   canManage,
-  onIncomeChange,
+  onAddSource,
 }: {
   bills: Bill[];
-  monthlyIncome: string;
+  budgetSources: BudgetSource[];
   canManage: boolean;
-  onIncomeChange: (value: string) => void;
+  onAddSource: (amount: string, source: string) => Promise<void>;
 }) {
-  const [incomeEditing, setIncomeEditing] = useState(false);
+  const [sourceDialogOpen, setSourceDialogOpen] = useState(false);
+  const [sourceAmount, setSourceAmount] = useState("");
+  const [sourceName, setSourceName] = useState("");
+  
   const monthNames = [
     "január",
     "február",
@@ -1823,7 +2135,12 @@ function BudgetView({
     (bill) => !bill.paid || (bill.paidAt || "").startsWith(currentMonthKey)
   );
   const plannedTotal = plannedBills.reduce((sum, bill) => sum + amountValue(bill.amount), 0);
-  const income = amountValue(monthlyIncome);
+ const totalSources = budgetSources.reduce(
+  (sum, source) => sum + amountValue(source.amount),
+  0
+);
+
+const remaining = totalSources - plannedTotal;
   const remaining = income - plannedTotal;
   const monthlyHistory = monthKeys.map((key) => {
     const [year, month] = key.split("-");
@@ -1837,7 +2154,23 @@ function BudgetView({
       ? monthlyHistory.reduce((sum, month) => sum + month.total, 0) / monthlyHistory.length
       : 0;
   const maxMonth = Math.max(...monthlyHistory.map((month) => month.total), 1);
+  const submitSource = async () => {
+  try {
+    await onAddSource(sourceAmount, sourceName);
 
+    setSourceAmount("");
+    setSourceName("");
+    setSourceDialogOpen(false);
+
+    toast.success("A pénzforrás hozzáadva.");
+  } catch (error) {
+    toast.error(
+      error instanceof Error
+        ? error.message
+        : "A pénzforrás hozzáadása nem sikerült."
+    );
+  }
+};
   return (
     <div className="animate-in fade-in duration-500">
       <div className="mb-6">
@@ -1848,34 +2181,28 @@ function BudgetView({
         <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <div className="mb-1.5 flex items-center justify-between gap-3">
-              <label className="block text-[11px] font-extrabold uppercase tracking-[0.12em] text-[#aaa6b8]">
-                Havi bevétel
-              </label>
-              {canManage && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setIncomeEditing((editing) => !editing)}
-                  className="h-8 rounded-[10px] border-[#383838] px-2.5 text-[10px] font-bold text-[#a69dff]"
-                >
-                  <Pencil className="mr-1 h-3 w-3" />
-                  {incomeEditing ? "Mentés" : "Módosítás"}
-                </Button>
-              )}
-            </div>
-            <div className="relative w-full sm:w-[260px]">
-              <Input
-                value={monthlyIncome}
-                disabled={!canManage || !incomeEditing}
-                onChange={(event) => onIncomeChange(event.target.value)}
-                inputMode="decimal"
-                placeholder="pl. 80000"
-                className="h-12 rounded-[13px] border-[#303030] bg-[#171717] pr-14 text-lg font-extrabold text-[#f3f0ff]"
-              />
-              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-extrabold text-[#aaa6b8]">
-                lej
-              </span>
-            </div>
+  <label className="block text-[11px] font-extrabold uppercase tracking-[0.12em] text-[#aaa6b8]">
+    Használható keret
+  </label>
+
+  {canManage && (
+    <Button
+      type="button"
+      variant="outline"
+      onClick={() => setSourceDialogOpen(true)}
+      className="h-8 rounded-[10px] border-[#383838] px-2.5 text-[10px] font-bold text-[#a69dff]"
+    >
+      <Plus className="mr-1 h-3 w-3" />
+      Pénz hozzáadása
+    </Button>
+  )}
+</div>
+
+<div className="relative w-full sm:w-[260px]">
+  <p className="h-12 rounded-[13px] border border-[#303030] bg-[#171717] px-3 flex items-center text-lg font-extrabold text-[#f3f0ff]">
+    {formatLeiTotal(totalSources)}
+  </p>
+</div>
           </div>
           <p className="max-w-[320px] text-xs leading-relaxed text-[#aaa6b8]">
             A felvitt számlák tervezett költségként levonódnak, a kifizetett vásárlások pedig bekerülnek a háromhavi átlagba.
@@ -1948,6 +2275,73 @@ function BudgetView({
         </section>
       </div>
     </div>
+     <Dialog
+      open={sourceDialogOpen}
+      onOpenChange={setSourceDialogOpen}
+    >
+      <DialogContent className="w-[calc(100%-24px)] max-w-[430px] rounded-[26px] border-[#303030] bg-[#111111] p-6">
+        <DialogHeader>
+          <DialogTitle className="text-xl font-extrabold text-[#f3f0ff]">
+            Új pénz hozzáadása
+          </DialogTitle>
+
+          <DialogDescription className="text-[#aaa6b8]">
+            Add meg az összeget és válaszd ki, kitől érkezett.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4 pt-2">
+          <div>
+            <label className="mb-1.5 block text-xs font-bold text-[#c8c3d5]">
+              Összeg
+            </label>
+
+            <div className="relative">
+              <Input
+                value={sourceAmount}
+                onChange={(event) => setSourceAmount(event.target.value)}
+                inputMode="decimal"
+                placeholder="pl. 1000"
+                className="h-11 rounded-[13px] border-[#303030] bg-[#171717] pr-14"
+                autoFocus
+              />
+
+              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-bold text-[#aaa6b8]">
+                lej
+              </span>
+            </div>
+          </div>
+
+          <div>
+            <label className="mb-1.5 block text-xs font-bold text-[#c8c3d5]">
+              Forrás
+            </label>
+
+            <select
+              value={sourceName}
+              onChange={(event) => setSourceName(event.target.value)}
+              className="h-11 w-full rounded-[13px] border border-[#303030] bg-[#171717] px-3 text-sm text-[#f3f0ff] outline-none"
+            >
+              <option value="">Válassz személyt</option>
+
+              {familyMembers.map((member) => (
+                <option key={member.name} value={member.name}>
+                  {member.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <Button
+            onClick={() => void submitSource()}
+            className="h-11 w-full rounded-[13px] bg-[#6d5ef5] font-bold hover:bg-[#5d4fe1]"
+          >
+            <Plus className="mr-1.5 h-4 w-4" />
+            Hozzáadás
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -2100,24 +2494,35 @@ function LeaderboardView() {
   );
 }
 
-function SettingsView() {
-  return (
-    <div className="animate-in fade-in duration-500">
-      <div className="mb-6">
-        <p className="mb-1 text-[12px] font-bold text-[#aaa6b8]">Készülék és fiók</p>
-        <h2 className="text-[28px] font-extrabold tracking-[-0.05em] text-[#f3f0ff]">
-          Beállítások
-        </h2>
-      </div>
-      <div className="rounded-[22px] border border-[#252525] bg-[#111111] p-6 space-y-4">
-        <div className="flex items-center gap-3 text-sm font-bold text-[#f3f0ff]">
-          <Users className="h-5 w-5 text-[#6d5ef5]" />
-          <span>Családtagok kezelése</span>
-        </div>
-        <p className="text-xs text-[#aaa6b8]">
-          A családtagok előre rögzítettek. Adminisztrátori jogkörrel minden funkció és módosítás elérhető.
-        </p>
-      </div>
-    </div>
-  );
+function SettingsView({ currentUser, isAdmin, members, onAddMember, onRemoveMember }: { currentUser: string; isAdmin: boolean; members: FamilyMember[]; onAddMember: (name: string) => Promise<void>; onRemoveMember: (name: string) => Promise<void> }) {
+  const [newName, setNewName] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const addUser = async () => {
+    setSaving(true);
+    try {
+      await onAddMember(newName);
+      setNewName("");
+      toast.success("Új felhasználó hozzáadva.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "A felhasználó hozzáadása nem sikerült.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeUser = async (member: FamilyMember) => {
+    if (!window.confirm(`Biztosan eltávolítod ${member.name} felhasználót?`)) return;
+    setSaving(true);
+    try {
+      await onRemoveMember(member.name);
+      toast.success(`${member.name} eltávolítva.`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "A felhasználó eltávolítása nem sikerült.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <div className="animate-in fade-in duration-500"><div className="mb-6"><p className="mb-1 text-[12px] font-bold text-[#aaa6b8]">Készülék és fiók</p><h2 className="text-[28px] font-extrabold tracking-[-0.05em] text-[#f3f0ff]">Beállítások</h2></div><div className="max-w-[680px] space-y-4"><div className="rounded-[22px] border border-[#252525] bg-[#111111] p-5 sm:p-6"><div className="mb-4 flex items-center gap-3 text-sm font-bold text-[#f3f0ff]"><Users className="h-5 w-5 text-[#6d5ef5]" /><span>Felhasználók</span><span className="rounded-full bg-[#26232f] px-2 py-0.5 text-[11px] text-[#aaa6b8]">{members.length}</span></div><div className="space-y-2">{members.map((member) => <div key={member.name} className="flex items-center gap-3 rounded-[15px] border border-[#252525] bg-[#171717] p-3"><div className={cn("flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xl", member.tone)}>{member.symbol}</div><div className="min-w-0 flex-1"><p className="truncate text-sm font-extrabold text-[#f3f0ff]">{member.name}{member.name === currentUser && <span className="ml-2 rounded-full bg-[#f0edff] px-2 py-1 text-[9px] font-extrabold text-[#6d5ef5]">TE</span>}</p><p className="mt-0.5 text-xs text-[#aaa6b8]">{member.role === "admin" ? "Adminisztrátor" : "Sima felhasználó"} · Aktív</p></div>{isAdmin && member.name !== "Elod" && <button disabled={saving} onClick={() => void removeUser(member)} aria-label={`${member.name} eltávolítása`} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[9px] border border-[#583333] text-[#e48868] hover:border-[#e05d5d]"><Trash2 className="h-3.5 w-3.5" /></button>}</div>)}</div></div>{isAdmin && <div className="rounded-[22px] border border-[#252525] bg-[#111111] p-5 sm:p-6"><div className="mb-3 flex items-center gap-3 text-sm font-bold text-[#f3f0ff]"><Plus className="h-5 w-5 text-[#6d5ef5]" /><span>Új felhasználó hozzáadása</span></div><p className="mb-4 text-xs text-[#aaa6b8]">Elod adminisztrátorként új sima felhasználót vehet fel.</p><div className="flex flex-col gap-2 sm:flex-row"><Input value={newName} onChange={(event) => setNewName(event.target.value)} onKeyDown={(event) => event.key === "Enter" && void addUser()} placeholder="Felhasználó neve" className="h-11 rounded-[13px] border-[#303030] bg-[#171717]" /><Button disabled={saving || !newName.trim()} onClick={() => void addUser()} className="h-11 rounded-[13px] bg-[#6d5ef5] font-bold hover:bg-[#5d4fe1]"><Plus className="mr-1.5 h-4 w-4" />Hozzáadás</Button></div></div>}</div></div>;
 }
