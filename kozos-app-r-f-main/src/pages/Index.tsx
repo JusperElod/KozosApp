@@ -790,7 +790,7 @@ function EditTaskDialog({
         </div>
       </DialogContent>
     </Dialog>
-    </div>
+   
   );
 }
 
